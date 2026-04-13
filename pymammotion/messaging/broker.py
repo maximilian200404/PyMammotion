@@ -65,10 +65,14 @@ class DeviceMessageBroker:
         self,
         send_fn: Callable[[], Awaitable[None]],
         expected_field: str,
-        send_timeout: float = 1.0,
-        retries: int = 3,
+        send_timeout: float = 5.0,
+        retries: int = 2,
     ) -> Any:
         """Send a command and wait for the matching protobuf response.
+
+        STABLE FIX: Increased send_timeout from 1.0→5.0s (cloud responses
+        can take 2-3s), reduced retries from 3→2 to avoid command storms,
+        added 2s backoff between retries.
 
         Args:
             send_fn: Async callable that sends the command over transport.
@@ -111,11 +115,12 @@ class DeviceMessageBroker:
                 except TimeoutError:
                     if attempt < retries:
                         _logger.debug(
-                            "No response for '%s' (attempt %d/%d), retrying",
+                            "No response for '%s' (attempt %d/%d), retrying in 2s",
                             expected_field,
                             attempt,
                             retries,
                         )
+                        await asyncio.sleep(2.0)  # STABLE FIX: backoff between retries
                     else:
                         raise CommandTimeoutError(expected_field, retries) from None
         finally:
