@@ -1,4 +1,8 @@
-"""Priority command queue with exclusive slots for saga operations."""
+"""Priority command queue with exclusive slots for saga operations.
+
+STABLE FIX: Added inter-command delay (1.5s) and exponential backoff
+on gateway timeouts to prevent Aliyun cloud rate limiting (429 errors).
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,7 @@ import contextlib
 from dataclasses import dataclass, field
 from enum import IntEnum
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from pymammotion.transport import TransportError
@@ -138,7 +143,16 @@ class DeviceCommandQueue:
         await self.enqueue(_run, priority=Priority.EXCLUSIVE)
 
     async def _process(self) -> None:
-        """Queue processor loop — runs as an asyncio background task."""
+        """Queue processor loop — runs as an asyncio background task.
+
+        STABLE FIX: Added 1.5s inter-command delay and exponential backoff
+        on gateway timeouts to prevent Aliyun 429 rate-limit errors.
+        The old stable pymammotion 0.5.26 used a sequential queue with
+        natural pacing; this restores that pattern.
+        """
+        _INTER_CMD_DELAY = 1.5  # min seconds between cloud commands
+        _last_cmd_time = 0.0
+
         while self._running:
             try:
                 item = await asyncio.wait_for(self._queue.get(), timeout=0.2)
@@ -156,24 +170,35 @@ class DeviceCommandQueue:
                 if item.skip_if_saga_active and self.is_saga_active and item.priority > Priority.EXCLUSIVE:
                     continue
 
+                # --- STABLE FIX: rate-limit cloud commands ---
+                now = time.monotonic()
+                elapsed = now - _last_cmd_time
+                if elapsed < _INTER_CMD_DELAY and item.priority > Priority.EMERGENCY:
+                    await asyncio.sleep(_INTER_CMD_DELAY - elapsed)
+
                 from pymammotion.aliyun.exceptions import GatewayTimeoutException
 
-                _gateway_timeout_max = 3
+                _gateway_timeout_max = 2  # reduced from 3
                 for _attempt in range(1, _gateway_timeout_max + 1):
                     self._current_work_task = asyncio.get_running_loop().create_task(
                         item.work()  # type: ignore[arg-type]
                     )
                     try:
                         await self._current_work_task
+                        _last_cmd_time = time.monotonic()
                         break  # success — exit retry loop
                     except GatewayTimeoutException:
+                        _last_cmd_time = time.monotonic()
                         if _attempt < _gateway_timeout_max:
+                            _backoff = 3.0 * _attempt  # 3s, 6s exponential
                             _logger.warning(
-                                "DeviceCommandQueue[%s]: gateway timeout (attempt %d/%d) — retrying",
+                                "DeviceCommandQueue[%s]: gateway timeout (attempt %d/%d) — retrying in %.1fs",
                                 self._device_name,
                                 _attempt,
                                 _gateway_timeout_max,
+                                _backoff,
                             )
+                            await asyncio.sleep(_backoff)
                         else:
                             _logger.warning(
                                 "DeviceCommandQueue[%s]: gateway timeout after %d attempts — dropping command",
