@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 from pymammotion.account.registry import BLE_ONLY_ACCOUNT, AccountRegistry, AccountSession
@@ -51,6 +52,7 @@ from pymammotion.transport.base import (
 )
 from pymammotion.transport.ble import BLETransport, BLETransportConfig
 from pymammotion.transport.mqtt import MQTTTransport, MQTTTransportConfig
+from pymammotion.utility.constant import WorkMode
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -67,6 +69,10 @@ if TYPE_CHECKING:
     from pymammotion.state.device_state import DeviceSnapshot
 
 _logger = logging.getLogger(__name__)
+
+# Cooldown after a failed MowPathSaga auto-trigger (seconds).
+# Prevents an infinite retry loop when the device does not respond.
+_MOW_PATH_RETRY_COOLDOWN = 300.0
 
 
 def _apply_geojson(device: MowingDevice) -> None:
@@ -183,6 +189,9 @@ class MammotionClient:
         self._iot_id_to_device_id: dict[str, str] = {}
         # RAII subscriptions for state-change watchers (keyed by device_name)
         self._watcher_subscriptions: dict[str, Subscription] = {}
+        # Tracks the last MowPathSaga failure time per device (monotonic seconds).
+        # Used to enforce _MOW_PATH_RETRY_COOLDOWN and prevent infinite saga loops.
+        self._mow_path_failure_times: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -231,11 +240,27 @@ class MammotionClient:
             device = snapshot.raw
             task_ids = device.events.work_tasks_event.ids
             work = device.report_data.work
-            actively_working = bool(task_ids) and work.ub_path_hash != 0
+            actively_working = (
+                bool(task_ids)
+                or work.ub_path_hash != 0
+                or work.path_hash != 0
+                or device.report_data.dev.sys_status == WorkMode.MODE_WORKING.value
+            )
             path_missing = actively_working and not device.map.current_mow_path
 
             if path_missing:
                 if handle.queue.is_saga_active:
+                    return
+                # Cooldown check: after a failed saga, wait before retrying to avoid
+                # an infinite loop (state-change fires every 5 s when path is missing).
+                last_fail = self._mow_path_failure_times.get(device_name, 0.0)
+                remaining = _MOW_PATH_RETRY_COOLDOWN - (time.monotonic() - last_fail)
+                if remaining > 0:
+                    _logger.debug(
+                        "Device %s: MowPathSaga cooldown active — %.0fs remaining, skipping auto-trigger",
+                        device_name,
+                        remaining,
+                    )
                     return
                 _logger.debug(
                     "Device %s is actively working — auto-fetching cover path for %d zone(s)",
@@ -245,14 +270,23 @@ class MammotionClient:
                 try:
                     await self.start_mow_path_saga(
                         device_name,
-                        zone_hashs=list(task_ids),
+                        zone_hashs=[],
                         skip_planning=True,
                     )
                 except Exception:  # noqa: BLE001
+                    # Record failure time so the cooldown suppresses immediate retries.
+                    self._mow_path_failure_times[device_name] = time.monotonic()
                     _logger.warning("Auto-trigger MowPathSaga failed for %s", device_name, exc_info=True)
 
-            if actively_working and device.map.current_mow_path:
+            if device.map.current_mow_path and not device.map.generated_mow_progress_geojson:
                 _apply_mow_progress_geojson(device)
+                # Path successfully obtained — clear any failure cooldown.
+                self._mow_path_failure_times.pop(device_name, None)
+
+            if not actively_working:
+                # Device stopped working — reset cooldown so the next mow session
+                # triggers the saga immediately.
+                self._mow_path_failure_times.pop(device_name, None)
 
         sub = handle.subscribe_state_changed(_on_state_changed)
         self._watcher_subscriptions[device_name] = sub
@@ -616,7 +650,7 @@ class MammotionClient:
                 if acct_session.token_manager is None:
                     acct_session.token_manager = TokenManager(account, mammotion_http)
                 transport = self._setup_mammotion_transport(
-                    mammotion_http.mqtt_credentials, mammotion_http, acct_session
+                    mammotion_http.mqtt_credentials, mammotion_http, acct_session, acct_session.token_manager
                 )
                 acct_session.mammotion_transport = transport
                 ua = acct_session.user_account
