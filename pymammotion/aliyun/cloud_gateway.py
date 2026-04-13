@@ -831,14 +831,17 @@ class CloudIOTGateway:
         logger.debug(iot_id)
 
         if response.status_code == 429:
-            logger.debug("too many requests.")
+            logger.warning("Too many requests (429) — backing off %.1fs", self.message_delay)
             if self.message_delay > 8:
                 raise TooManyRequestsException(response.status_message, iot_id)
-            asyncio.get_event_loop().call_later(
-                self.message_delay, lambda: asyncio.ensure_future(self.send_cloud_command(iot_id, command))
-            )
+            # STABLE FIX: await the backoff instead of fire-and-forget via call_later.
+            # The old call_later pattern created unawaited coroutines and didn't
+            # actually slow down the caller, leading to cascading 429 errors.
+            await asyncio.sleep(self.message_delay)
             self.message_delay = self.message_delay * 2
-            return message_id
+            # Retry once after backoff; if it fails again the next call will
+            # see the doubled message_delay and back off even more.
+            return await self.send_cloud_command(iot_id, command)
 
         response_body_str = response.body.decode("utf-8")
         response_body_dict = self.parse_json_response(response_body_str)
