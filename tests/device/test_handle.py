@@ -433,7 +433,7 @@ async def test_snapshot_raw_updates_after_on_raw_message() -> None:
 
 
 async def test_on_raw_message_emits_even_when_diff_is_empty() -> None:
-    """state_changed_bus must fire for every protobuf message.
+    """state_changed_bus must fire for non-stale protobuf messages.
 
     Subscribers (watch_field, HA coordinators) inspect snapshot.raw fields
     that _diff() deliberately skips. If we gate emission on _diff, updates
@@ -462,3 +462,71 @@ async def test_on_raw_message_emits_even_when_diff_is_empty() -> None:
 
     assert len(received) == 1
     assert handle.snapshot.raw.mower_state.rain_detection is True
+
+
+async def test_on_raw_message_ignores_stale_report_timestamp() -> None:
+    """Older toapp_report_data messages must not overwrite newer live state."""
+    from pymammotion.data.model.device import MowerDevice
+    from pymammotion.proto import LubaMsg, MctlSys, ReportInfoData, RptConnectStatus, RptDevStatus, RptRtk, RptWork
+
+    handle = DeviceHandle(
+        device_id="dev-stale",
+        device_name="Luba-Stale",
+        initial_device=MowerDevice(name="Luba-Stale"),
+    )
+
+    received: list[object] = []
+
+    async def _handler(snapshot: object) -> None:
+        received.append(snapshot)
+
+    handle.subscribe_state_changed(_handler)
+
+    fresh = LubaMsg(
+        sys=MctlSys(
+            toapp_report_data=ReportInfoData(
+                connect=RptConnectStatus(ble_rssi=-45, wifi_rssi=-51, mnet_rssi=-67),
+                dev=RptDevStatus(
+                    battery_val=37,
+                    charge_state=2,
+                    sys_status=13,
+                    sys_time_stamp=200,
+                ),
+                rtk=RptRtk(gps_stars=23, co_view_stars=18),
+                work=RptWork(progress=61, area=321, knife_height=55, man_run_speed=29),
+            )
+        )
+    )
+    stale = LubaMsg(
+        sys=MctlSys(
+            toapp_report_data=ReportInfoData(
+                connect=RptConnectStatus(ble_rssi=-60, wifi_rssi=-80, mnet_rssi=-90),
+                dev=RptDevStatus(
+                    battery_val=82,
+                    charge_state=1,
+                    sys_status=19,
+                    sys_time_stamp=150,
+                ),
+                rtk=RptRtk(gps_stars=7, co_view_stars=3),
+                work=RptWork(progress=4, area=999, knife_height=40, man_run_speed=12),
+            )
+        )
+    )
+
+    await handle.on_raw_message(bytes(fresh))
+    await handle.on_raw_message(bytes(stale))
+
+    report = handle.snapshot.raw.report_data
+    assert report.dev.battery_val == 37
+    assert report.dev.charge_state == 2
+    assert int(report.dev.sys_time_stamp) == 200
+    assert report.connect.wifi_rssi == -51
+    assert report.connect.ble_rssi == -45
+    assert report.connect.mnet_rssi == -67
+    assert report.rtk.gps_stars == 23
+    assert report.rtk.co_view_stars == 18
+    assert report.work.progress == 61
+    assert report.work.area == 321
+    assert report.work.knife_height == 55
+    assert report.work.man_run_speed == 29
+    assert len(received) == 1
