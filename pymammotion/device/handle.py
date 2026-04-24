@@ -231,6 +231,37 @@ class DeviceHandle:
         if transport is not None:
             await transport.disconnect()
 
+    @staticmethod
+    def _coerce_report_timestamp(value: object) -> int | None:
+        """Convert a report timestamp value into an integer when present."""
+        if value in (None, "", 0, "0"):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _current_report_timestamp(self) -> int | None:
+        """Return the latest applied report timestamp from the current snapshot."""
+        current = self.state_machine.current.raw
+        report_data = getattr(current, "report_data", None)
+        dev = getattr(report_data, "dev", None)
+        return self._coerce_report_timestamp(getattr(dev, "sys_time_stamp", None))
+
+    def _incoming_report_timestamp(self, message: LubaMsg) -> int | None:
+        """Return the report timestamp embedded in an incoming protobuf message."""
+        sys_msg = getattr(message, "sys", None)
+        if sys_msg is None:
+            return None
+        report = getattr(sys_msg, "toapp_report_data", None)
+        if report is None:
+            return None
+        dev = getattr(report, "dev", None)
+        if dev is None:
+            return None
+        return self._coerce_report_timestamp(getattr(dev, "sys_time_stamp", None))
+
     async def on_raw_message(self, payload: bytes, transport_type: TransportType = TransportType.CLOUD_ALIYUN) -> None:
         """Receive raw bytes from transport, decode, update state, route to broker.
 
@@ -255,6 +286,23 @@ class DeviceHandle:
 
         if self._availability.mqtt_reported_offline and transport_type != TransportType.BLE:
             self.update_availability(transport_type, self._availability.mqtt, mqtt_reported_offline=False)
+
+        incoming_report_ts = self._incoming_report_timestamp(luba_msg)
+        current_report_ts = self._current_report_timestamp()
+        if (
+            incoming_report_ts is not None
+            and current_report_ts is not None
+            and incoming_report_ts < current_report_ts
+        ):
+            _logger.debug(
+                "Ignoring stale report_data for '%s': incoming_ts=%s current_ts=%s transport=%s",
+                self.device_name,
+                incoming_report_ts,
+                current_report_ts,
+                transport_type.value,
+            )
+            await self.broker.on_message(luba_msg)
+            return
 
         # 3. Apply to state via reducer (returns a new MowingDevice copy)
         updated_device = self._reducer.apply(self.state_machine.current.raw, luba_msg)

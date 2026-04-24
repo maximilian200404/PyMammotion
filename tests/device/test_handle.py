@@ -424,6 +424,39 @@ async def test_snapshot_raw_updates_after_on_raw_message() -> None:
     assert handle.snapshot.raw.report_data.dev.battery_val == 42
 
 
+async def test_on_raw_message_ignores_older_report_timestamp() -> None:
+    """Older report_data packets must not overwrite the current device state."""
+    from pymammotion.data.model.device import MowerDevice
+    from pymammotion.proto import LubaMsg, MctlSys, ReportInfoData, RptDevStatus
+
+    handle = DeviceHandle(
+        device_id="dev-stale",
+        device_name="Luba-Test",
+        initial_device=MowerDevice(name="Luba-Test"),
+    )
+
+    fresh = LubaMsg(
+        sys=MctlSys(
+            toapp_report_data=ReportInfoData(
+                dev=RptDevStatus(battery_val=37, sys_time_stamp=2000)
+            )
+        )
+    )
+    stale = LubaMsg(
+        sys=MctlSys(
+            toapp_report_data=ReportInfoData(
+                dev=RptDevStatus(battery_val=82, sys_time_stamp=1000)
+            )
+        )
+    )
+
+    await handle.on_raw_message(bytes(fresh))
+    await handle.on_raw_message(bytes(stale))
+
+    assert handle.snapshot.raw.report_data.dev.battery_val == 37
+    assert handle.snapshot.raw.report_data.dev.sys_time_stamp == 2000
+
+
 # ---------------------------------------------------------------------------
 # Regression: protobuf path must emit even when no snapshot-level field changes.
 # DeviceSnapshot._diff only looks at connection_state/online/enabled/battery.
